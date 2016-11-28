@@ -19,6 +19,8 @@ import (
 	containertypes "github.com/docker/docker/api/types/container"
 	mounttypes "github.com/docker/docker/api/types/mount"
 	networktypes "github.com/docker/docker/api/types/network"
+	swarmtypes "github.com/docker/docker/api/types/swarm"
+	"github.com/docker/docker/container/stream"
 	"github.com/docker/docker/daemon/exec"
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/daemon/logger/jsonfilelog"
@@ -40,6 +42,7 @@ import (
 	"github.com/docker/libnetwork/netlabel"
 	"github.com/docker/libnetwork/options"
 	"github.com/docker/libnetwork/types"
+	agentexec "github.com/docker/swarmkit/agent/exec"
 	"github.com/opencontainers/runc/libcontainer/label"
 )
 
@@ -65,9 +68,9 @@ func (DetachError) Error() string {
 // CommonContainer holds the fields for a container which are
 // applicable across all platforms supported by the daemon.
 type CommonContainer struct {
-	*runconfig.StreamConfig
+	StreamConfig *stream.Config
 	// embed for Container to support states directly.
-	*State          `json:"State"` // Needed for remote api version <= 1.11
+	*State          `json:"State"` // Needed for Engine API version <= 1.11
 	Root            string         `json:"-"` // Path to the "home" of the container, including metadata.
 	BaseFS          string         `json:"-"` // Path to the graphdriver mountpoint
 	RWLayer         layer.RWLayer  `json:"-"`
@@ -89,9 +92,10 @@ type CommonContainer struct {
 	HasBeenStartedBefore   bool
 	HasBeenManuallyStopped bool // used for unless-stopped restart policy
 	MountPoints            map[string]*volume.MountPoint
-	HostConfig             *containertypes.HostConfig        `json:"-"` // do not serialize the host config in the json, otherwise we'll make the container unportable
-	ExecCommands           *exec.Store                       `json:"-"`
-	Secrets                []*containertypes.ContainerSecret `json:"-"` // do not serialize
+	HostConfig             *containertypes.HostConfig `json:"-"` // do not serialize the host config in the json, otherwise we'll make the container unportable
+	ExecCommands           *exec.Store                `json:"-"`
+	SecretStore            agentexec.SecretGetter     `json:"-"`
+	SecretReferences       []*swarmtypes.SecretReference
 	// logDriver for closing
 	LogDriver      logger.Logger  `json:"-"`
 	LogCopier      *logger.Copier `json:"-"`
@@ -109,7 +113,7 @@ func NewBaseContainer(id, root string) *Container {
 			ExecCommands:  exec.NewStore(),
 			Root:          root,
 			MountPoints:   make(map[string]*volume.MountPoint),
-			StreamConfig:  runconfig.NewStreamConfig(),
+			StreamConfig:  stream.NewConfig(),
 			attachContext: &attachContext{},
 		},
 	}
@@ -318,10 +322,11 @@ func (container *Container) CheckpointDir() string {
 }
 
 // StartLogger starts a new logger driver for the container.
-func (container *Container) StartLogger(cfg containertypes.LogConfig) (logger.Logger, error) {
+func (container *Container) StartLogger() (logger.Logger, error) {
+	cfg := container.HostConfig.LogConfig
 	c, err := logger.GetLogDriver(cfg.Type)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get logging factory: %v", err)
+		return nil, fmt.Errorf("failed to get logging factory: %v", err)
 	}
 	ctx := logger.Context{
 		Config:              cfg.Config,
@@ -377,7 +382,7 @@ func (container *Container) Attach(stdin io.ReadCloser, stdout io.Writer, stderr
 
 // AttachStreams connects streams to a TTY.
 // Used by exec too. Should this move somewhere else?
-func AttachStreams(ctx context.Context, streamConfig *runconfig.StreamConfig, openStdin, stdinOnce, tty bool, stdin io.ReadCloser, stdout io.Writer, stderr io.Writer, keys []byte) chan error {
+func AttachStreams(ctx context.Context, streamConfig *stream.Config, openStdin, stdinOnce, tty bool, stdin io.ReadCloser, stdout io.Writer, stderr io.Writer, keys []byte) chan error {
 	var (
 		cStdout, cStderr io.ReadCloser
 		cStdin           io.WriteCloser
@@ -1046,9 +1051,9 @@ func (container *Container) startLogging() error {
 		return nil // do not start logging routines
 	}
 
-	l, err := container.StartLogger(container.HostConfig.LogConfig)
+	l, err := container.StartLogger()
 	if err != nil {
-		return fmt.Errorf("Failed to initialize logging driver: %v", err)
+		return fmt.Errorf("failed to initialize logging driver: %v", err)
 	}
 
 	copier := logger.NewCopier(map[string]io.Reader{"stdout": container.StdoutPipe(), "stderr": container.StderrPipe()}, l)
@@ -1064,6 +1069,26 @@ func (container *Container) startLogging() error {
 	return nil
 }
 
+// StdinPipe gets the stdin stream of the container
+func (container *Container) StdinPipe() io.WriteCloser {
+	return container.StreamConfig.StdinPipe()
+}
+
+// StdoutPipe gets the stdout stream of the container
+func (container *Container) StdoutPipe() io.ReadCloser {
+	return container.StreamConfig.StdoutPipe()
+}
+
+// StderrPipe gets the stderr stream of the container
+func (container *Container) StderrPipe() io.ReadCloser {
+	return container.StreamConfig.StderrPipe()
+}
+
+// CloseStreams closes the container's stdio streams
+func (container *Container) CloseStreams() error {
+	return container.StreamConfig.CloseStreams()
+}
+
 // InitializeStdio is called by libcontainerd to connect the stdio.
 func (container *Container) InitializeStdio(iop libcontainerd.IOPipe) error {
 	if err := container.startLogging(); err != nil {
@@ -1073,7 +1098,7 @@ func (container *Container) InitializeStdio(iop libcontainerd.IOPipe) error {
 
 	container.StreamConfig.CopyToPipe(iop)
 
-	if container.Stdin() == nil && !container.Config.Tty {
+	if container.StreamConfig.Stdin() == nil && !container.Config.Tty {
 		if iop.Stdin != nil {
 			if err := iop.Stdin.Close(); err != nil {
 				logrus.Warnf("error closing stdin: %+v", err)

@@ -260,8 +260,9 @@ func (s *Server) IssueNodeCertificate(ctx context.Context, request *api.IssueNod
 					},
 				},
 				Spec: api.NodeSpec{
-					Role:       role,
-					Membership: api.NodeMembershipAccepted,
+					Role:         role,
+					Membership:   api.NodeMembershipAccepted,
+					Availability: request.Availability,
 				},
 			}
 
@@ -617,7 +618,7 @@ func (s *Server) signNodeCert(ctx context.Context, node *api.Node) error {
 	)
 
 	// Try using the external CA first.
-	cert, err := externalCA.Sign(PrepareCSR(rawCSR, cn, ou, org))
+	cert, err := externalCA.Sign(ctx, PrepareCSR(rawCSR, cn, ou, org))
 	if err == ErrNoExternalCAURLs {
 		// No external CA servers configured. Try using the local CA.
 		cert, err = rootCA.ParseValidateAndSignCSR(rawCSR, cn, ou, org)

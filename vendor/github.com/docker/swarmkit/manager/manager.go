@@ -99,6 +99,9 @@ type Config struct {
 	// bootstrapping a cluster for the first time (it's a cluster-wide setting),
 	// and also when loading up any raft data on disk (as a KEK for the raft DEK).
 	UnlockKey []byte
+
+	// Availability allows a user to control the current scheduling status of a node
+	Availability api.NodeSpec_Availability
 }
 
 // Manager is the cluster manager for Swarm.
@@ -256,7 +259,7 @@ func New(config *Config) (*Manager, error) {
 		listeners:   listeners,
 		caserver:    ca.NewServer(raftNode.MemoryStore(), config.SecurityConfig),
 		dispatcher:  dispatcher.New(raftNode, dispatcherConfig),
-		logbroker:   logbroker.New(),
+		logbroker:   logbroker.New(raftNode.MemoryStore()),
 		server:      grpc.NewServer(opts...),
 		localserver: grpc.NewServer(opts...),
 		raftNode:    raftNode,
@@ -385,14 +388,10 @@ func (m *Manager) Run(parent context.Context) error {
 
 	close(m.started)
 
-	watchDone := make(chan struct{})
-	watchCtx, watchCtxCancel := context.WithCancel(parent)
 	go func() {
 		err := m.raftNode.Run(ctx)
-		watchCtxCancel()
-		<-watchDone
 		if err != nil {
-			log.G(ctx).Error(err)
+			log.G(ctx).WithError(err).Error("raft node stopped")
 			m.Stop(ctx)
 		}
 	}()
@@ -407,7 +406,7 @@ func (m *Manager) Run(parent context.Context) error {
 	}
 	raftConfig := c.Spec.Raft
 
-	if err := m.watchForKEKChanges(watchCtx, watchDone); err != nil {
+	if err := m.watchForKEKChanges(ctx); err != nil {
 		return err
 	}
 
@@ -544,8 +543,7 @@ func (m *Manager) updateKEK(ctx context.Context, cluster *api.Cluster) error {
 	return nil
 }
 
-func (m *Manager) watchForKEKChanges(ctx context.Context, watchDone chan struct{}) error {
-	defer close(watchDone)
+func (m *Manager) watchForKEKChanges(ctx context.Context) error {
 	clusterID := m.config.SecurityConfig.ClientTLSCreds.Organization()
 	clusterWatch, clusterWatchCancel, err := store.ViewAndWatch(m.raftNode.MemoryStore(),
 		func(tx store.ReadTx) error {
@@ -750,7 +748,7 @@ func (m *Manager) becomeLeader(ctx context.Context) {
 			rootCA))
 		// Add Node entry for ourself, if one
 		// doesn't exist already.
-		store.CreateNode(tx, managerNode(nodeID))
+		store.CreateNode(tx, managerNode(nodeID, m.config.Availability))
 		return nil
 	})
 
@@ -914,7 +912,7 @@ func defaultClusterObject(
 }
 
 // managerNode creates a new node with NodeRoleManager role.
-func managerNode(nodeID string) *api.Node {
+func managerNode(nodeID string, availability api.NodeSpec_Availability) *api.Node {
 	return &api.Node{
 		ID: nodeID,
 		Certificate: api.Certificate{
@@ -925,8 +923,9 @@ func managerNode(nodeID string) *api.Node {
 			},
 		},
 		Spec: api.NodeSpec{
-			Role:       api.NodeRoleManager,
-			Membership: api.NodeMembershipAccepted,
+			Role:         api.NodeRoleManager,
+			Membership:   api.NodeMembershipAccepted,
+			Availability: availability,
 		},
 	}
 }

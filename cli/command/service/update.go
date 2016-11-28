@@ -133,9 +133,13 @@ func runUpdate(dockerCli *command.DockerCli, flags *pflag.FlagSet, serviceID str
 		updateOpts.RegistryAuthFrom = types.RegistryAuthFromSpec
 	}
 
-	err = apiClient.ServiceUpdate(ctx, service.ID, service.Version, *spec, updateOpts)
+	response, err := apiClient.ServiceUpdate(ctx, service.ID, service.Version, *spec, updateOpts)
 	if err != nil {
 		return err
+	}
+
+	for _, warning := range response.Warnings {
+		fmt.Fprintln(dockerCli.Err(), warning)
 	}
 
 	fmt.Fprintf(dockerCli.Out(), "%s\n", serviceID)
@@ -204,6 +208,7 @@ func updateService(flags *pflag.FlagSet, spec *swarm.ServiceSpec) error {
 	updateEnvironment(flags, &cspec.Env)
 	updateString(flagWorkdir, &cspec.Dir)
 	updateString(flagUser, &cspec.User)
+	updateString(flagHostname, &cspec.Hostname)
 	if err := updateMounts(flags, &cspec.Mounts); err != nil {
 		return err
 	}

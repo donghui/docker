@@ -123,8 +123,8 @@ and pass along signals. All of that is configurable:
     --sig-proxy=true: Proxy all received signals to the process (non-TTY mode only)
     -i              : Keep STDIN open even if not attached
 
-If you do not specify `-a` then Docker will [attach all standard
-streams]( https://github.com/docker/docker/blob/75a7f4d90cde0295bcfb7213004abce8d4779b75/commands.go#L1797).
+If you do not specify `-a` then Docker will [attach to both stdout and stderr
+]( https://github.com/docker/docker/blob/4118e0c9eebda2412a09ae66e90c34b85fae3275/runconfig/opts/parse.go#L267).
 You can specify to which of the three standard streams (`STDIN`, `STDOUT`,
 `STDERR`) you'd like to connect instead, as in:
 
@@ -1237,10 +1237,6 @@ use of facilities allowed by the capabilities, so you should not have to adjust 
 since Docker 1.12. In Docker 1.10 and 1.11 this did not happen and it may be necessary
 to use a custom seccomp profile or use `--security-opt seccomp=unconfined` when adding
 capabilities.
-
-It is only possible to grant capabilities to a container running as a user other than `root`
-on a system with a Linux kernel version of 4.3 or later, as this requires "ambient capabilities"
-to be granted. These will be added if the kernel allows it from Docker version 1.13.
 
 ## Logging drivers (--log-driver)
 

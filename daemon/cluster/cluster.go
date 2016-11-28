@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Sirupsen/logrus"
+	distreference "github.com/docker/distribution/reference"
 	apierrors "github.com/docker/docker/api/errors"
 	apitypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
@@ -60,16 +61,13 @@ var ErrNoSwarm = fmt.Errorf("This node is not part of a swarm")
 // ErrSwarmExists is returned on initialize or join request for a cluster that has already been activated
 var ErrSwarmExists = fmt.Errorf("This node is already part of a swarm. Use \"docker swarm leave\" to leave this swarm and join another one.")
 
-// ErrPendingSwarmExists is returned on initialize or join request for a cluster that is already processing a similar request but has not succeeded yet.
-var ErrPendingSwarmExists = fmt.Errorf("This node is processing an existing join request that has not succeeded yet. Use \"docker swarm leave\" to cancel the current request.")
-
 // ErrSwarmJoinTimeoutReached is returned when cluster join could not complete before timeout was reached.
 var ErrSwarmJoinTimeoutReached = fmt.Errorf("Timeout was reached before node was joined. The attempt to join the swarm will continue in the background. Use the \"docker info\" command to see the current swarm status of your node.")
 
 // ErrSwarmLocked is returned if the swarm is encrypted and needs a key to unlock it.
 var ErrSwarmLocked = fmt.Errorf("Swarm is encrypted and needs to be unlocked before it can be used. Please use \"docker swarm unlock\" to unlock it.")
 
-// ErrSwarmCertificatesExipred is returned if docker was not started for the whole validity period and they had no chance to renew automatically.
+// ErrSwarmCertificatesExpired is returned if docker was not started for the whole validity period and they had no chance to renew automatically.
 var ErrSwarmCertificatesExpired = errors.New("Swarm certificates have expired. To replace them, leave the swarm and join again.")
 
 // NetworkSubnetsProvider exposes functions for retrieving the subnets
@@ -587,17 +585,26 @@ func (c *Cluster) GetUnlockKey() (string, error) {
 
 // UnlockSwarm provides a key to decrypt data that is encrypted at rest.
 func (c *Cluster) UnlockSwarm(req types.UnlockRequest) error {
+	c.RLock()
+	if !c.isActiveManager() {
+		if err := c.errNoManager(); err != ErrSwarmLocked {
+			c.RUnlock()
+			return err
+		}
+	}
+
+	if c.node != nil || c.locked != true {
+		c.RUnlock()
+		return errors.New("swarm is not locked")
+	}
+	c.RUnlock()
+
 	key, err := encryption.ParseHumanReadableKey(req.UnlockKey)
 	if err != nil {
 		return err
 	}
 
 	c.Lock()
-	if c.node != nil || c.locked != true {
-		c.Unlock()
-		return errors.New("swarm is not locked")
-	}
-
 	config := *c.lastNodeConfig
 	config.lockKey = key
 	n, err := c.startNewNode(config)
@@ -1008,16 +1015,25 @@ func (c *Cluster) GetServices(options apitypes.ServiceListOptions) ([]types.Serv
 
 // imageWithDigestString takes an image such as name or name:tag
 // and returns the image pinned to a digest, such as name@sha256:34234...
+// Due to the difference between the docker/docker/reference, and the
+// docker/distribution/reference packages, we're parsing the image twice.
+// As the two packages converge, this function should be simplified.
+// TODO(nishanttotla): After the packages converge, the function must
+// convert distreference.Named -> distreference.Canonical, and the logic simplified.
 func (c *Cluster) imageWithDigestString(ctx context.Context, image string, authConfig *apitypes.AuthConfig) (string, error) {
-	ref, err := reference.ParseNamed(image)
+	ref, err := distreference.ParseNamed(image)
 	if err != nil {
 		return "", err
 	}
 	// only query registry if not a canonical reference (i.e. with digest)
-	if _, ok := ref.(reference.Canonical); !ok {
-		ref = reference.WithDefaultTag(ref)
-
-		namedTaggedRef, ok := ref.(reference.NamedTagged)
+	if _, ok := ref.(distreference.Canonical); !ok {
+		// create a docker/docker/reference Named object because GetRepository needs it
+		dockerRef, err := reference.ParseNamed(image)
+		if err != nil {
+			return "", err
+		}
+		dockerRef = reference.WithDefaultTag(dockerRef)
+		namedTaggedRef, ok := dockerRef.(reference.NamedTagged)
 		if !ok {
 			return "", fmt.Errorf("unable to cast image to NamedTagged reference object")
 		}
@@ -1031,28 +1047,23 @@ func (c *Cluster) imageWithDigestString(ctx context.Context, image string, authC
 			return "", err
 		}
 
-		// TODO(nishanttotla): Currently, the service would lose the tag while calling WithDigest
-		// To prevent this, we create the image string manually, which is a bad idea in general
-		// This will be fixed when https://github.com/docker/distribution/pull/2044 is vendored
-		// namedDigestedRef, err := reference.WithDigest(ref, dscrptr.Digest)
-		// if err != nil {
-		// 	return "", err
-		// }
-		// return namedDigestedRef.String(), nil
-		return image + "@" + dscrptr.Digest.String(), nil
-	} else {
-		// reference already contains a digest, so just return it
-		return ref.String(), nil
+		namedDigestedRef, err := distreference.WithDigest(distreference.EnsureTagged(ref), dscrptr.Digest)
+		if err != nil {
+			return "", err
+		}
+		return namedDigestedRef.String(), nil
 	}
+	// reference already contains a digest, so just return it
+	return ref.String(), nil
 }
 
 // CreateService creates a new service in a managed swarm cluster.
-func (c *Cluster) CreateService(s types.ServiceSpec, encodedAuth string) (string, error) {
+func (c *Cluster) CreateService(s types.ServiceSpec, encodedAuth string) (*apitypes.ServiceCreateResponse, error) {
 	c.RLock()
 	defer c.RUnlock()
 
 	if !c.isActiveManager() {
-		return "", c.errNoManager()
+		return nil, c.errNoManager()
 	}
 
 	ctx, cancel := c.getRequestContext()
@@ -1060,17 +1071,17 @@ func (c *Cluster) CreateService(s types.ServiceSpec, encodedAuth string) (string
 
 	err := c.populateNetworkID(ctx, c.client, &s)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	serviceSpec, err := convert.ServiceSpecToGRPC(s)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	ctnr := serviceSpec.Task.GetContainer()
 	if ctnr == nil {
-		return "", fmt.Errorf("service does not use container tasks")
+		return nil, fmt.Errorf("service does not use container tasks")
 	}
 
 	if encodedAuth != "" {
@@ -1084,11 +1095,15 @@ func (c *Cluster) CreateService(s types.ServiceSpec, encodedAuth string) (string
 			logrus.Warnf("invalid authconfig: %v", err)
 		}
 	}
+
+	resp := &apitypes.ServiceCreateResponse{}
+
 	// pin image by digest
 	if os.Getenv("DOCKER_SERVICE_PREFER_OFFLINE_IMAGE") != "1" {
 		digestImage, err := c.imageWithDigestString(ctx, ctnr.Image, authConfig)
 		if err != nil {
 			logrus.Warnf("unable to pin image %s to digest: %s", ctnr.Image, err.Error())
+			resp.Warnings = append(resp.Warnings, fmt.Sprintf("unable to pin image %s to digest: %s", ctnr.Image, err.Error()))
 		} else {
 			logrus.Debugf("pinning image %s by digest: %s", ctnr.Image, digestImage)
 			ctnr.Image = digestImage
@@ -1097,10 +1112,11 @@ func (c *Cluster) CreateService(s types.ServiceSpec, encodedAuth string) (string
 
 	r, err := c.client.CreateService(ctx, &swarmapi.CreateServiceRequest{Spec: &serviceSpec})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	return r.Service.ID, nil
+	resp.ID = r.Service.ID
+	return resp, nil
 }
 
 // GetService returns a service based on an ID or name.
@@ -1123,12 +1139,12 @@ func (c *Cluster) GetService(input string) (types.Service, error) {
 }
 
 // UpdateService updates existing service to match new properties.
-func (c *Cluster) UpdateService(serviceIDOrName string, version uint64, spec types.ServiceSpec, encodedAuth string, registryAuthFrom string) error {
+func (c *Cluster) UpdateService(serviceIDOrName string, version uint64, spec types.ServiceSpec, encodedAuth string, registryAuthFrom string) (*apitypes.ServiceUpdateResponse, error) {
 	c.RLock()
 	defer c.RUnlock()
 
 	if !c.isActiveManager() {
-		return c.errNoManager()
+		return nil, c.errNoManager()
 	}
 
 	ctx, cancel := c.getRequestContext()
@@ -1136,22 +1152,22 @@ func (c *Cluster) UpdateService(serviceIDOrName string, version uint64, spec typ
 
 	err := c.populateNetworkID(ctx, c.client, &spec)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	serviceSpec, err := convert.ServiceSpecToGRPC(spec)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	currentService, err := getService(ctx, c.client, serviceIDOrName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	newCtnr := serviceSpec.Task.GetContainer()
 	if newCtnr == nil {
-		return fmt.Errorf("service does not use container tasks")
+		return nil, fmt.Errorf("service does not use container tasks")
 	}
 
 	if encodedAuth != "" {
@@ -1165,14 +1181,14 @@ func (c *Cluster) UpdateService(serviceIDOrName string, version uint64, spec typ
 			ctnr = currentService.Spec.Task.GetContainer()
 		case apitypes.RegistryAuthFromPreviousSpec:
 			if currentService.PreviousSpec == nil {
-				return fmt.Errorf("service does not have a previous spec")
+				return nil, fmt.Errorf("service does not have a previous spec")
 			}
 			ctnr = currentService.PreviousSpec.Task.GetContainer()
 		default:
-			return fmt.Errorf("unsupported registryAuthFromValue")
+			return nil, fmt.Errorf("unsupported registryAuthFromValue")
 		}
 		if ctnr == nil {
-			return fmt.Errorf("service does not use container tasks")
+			return nil, fmt.Errorf("service does not use container tasks")
 		}
 		newCtnr.PullOptions = ctnr.PullOptions
 		// update encodedAuth so it can be used to pin image by digest
@@ -1188,11 +1204,15 @@ func (c *Cluster) UpdateService(serviceIDOrName string, version uint64, spec typ
 			logrus.Warnf("invalid authconfig: %v", err)
 		}
 	}
+
+	resp := &apitypes.ServiceUpdateResponse{}
+
 	// pin image by digest
 	if os.Getenv("DOCKER_SERVICE_PREFER_OFFLINE_IMAGE") != "1" {
 		digestImage, err := c.imageWithDigestString(ctx, newCtnr.Image, authConfig)
 		if err != nil {
 			logrus.Warnf("unable to pin image %s to digest: %s", newCtnr.Image, err.Error())
+			resp.Warnings = append(resp.Warnings, fmt.Sprintf("unable to pin image %s to digest: %s", newCtnr.Image, err.Error()))
 		} else if newCtnr.Image != digestImage {
 			logrus.Debugf("pinning image %s by digest: %s", newCtnr.Image, digestImage)
 			newCtnr.Image = digestImage
@@ -1209,7 +1229,8 @@ func (c *Cluster) UpdateService(serviceIDOrName string, version uint64, spec typ
 			},
 		},
 	)
-	return err
+
+	return resp, err
 }
 
 // RemoveService removes a service from a managed swarm cluster.
@@ -1254,7 +1275,7 @@ func (c *Cluster) ServiceLogs(ctx context.Context, input string, config *backend
 			ServiceIDs: []string{service.ID},
 		},
 		Options: &swarmapi.LogSubscriptionOptions{
-			Follow: true,
+			Follow: config.Follow,
 		},
 	})
 	if err != nil {
@@ -1369,7 +1390,7 @@ func (c *Cluster) GetNode(input string) (types.Node, error) {
 }
 
 // UpdateNode updates existing nodes properties.
-func (c *Cluster) UpdateNode(nodeID string, version uint64, spec types.NodeSpec) error {
+func (c *Cluster) UpdateNode(input string, version uint64, spec types.NodeSpec) error {
 	c.RLock()
 	defer c.RUnlock()
 
@@ -1385,10 +1406,15 @@ func (c *Cluster) UpdateNode(nodeID string, version uint64, spec types.NodeSpec)
 	ctx, cancel := c.getRequestContext()
 	defer cancel()
 
+	currentNode, err := getNode(ctx, c.client, input)
+	if err != nil {
+		return err
+	}
+
 	_, err = c.client.UpdateNode(
 		ctx,
 		&swarmapi.UpdateNodeRequest{
-			NodeID: nodeID,
+			NodeID: currentNode.ID,
 			Spec:   &nodeSpec,
 			NodeVersion: &swarmapi.Version{
 				Index: version,
@@ -1738,7 +1764,7 @@ func (c *Cluster) populateNetworkID(ctx context.Context, client swarmapi.Control
 		apiNetwork, err := getNetwork(ctx, client, n.Target)
 		if err != nil {
 			if ln, _ := c.config.Backend.FindNetwork(n.Target); ln != nil && !ln.Info().Dynamic() {
-				err = fmt.Errorf("network %s is not eligible for docker services", ln.Name())
+				err = fmt.Errorf("The network %s cannot be used with services. Only networks scoped to the swarm can be used, such as those created with the overlay driver.", ln.Name())
 				return apierrors.NewRequestForbiddenError(err)
 			}
 			return err
@@ -1746,33 +1772,6 @@ func (c *Cluster) populateNetworkID(ctx context.Context, client swarmapi.Control
 		networks[i].Target = apiNetwork.ID
 	}
 	return nil
-}
-
-func getNetwork(ctx context.Context, c swarmapi.ControlClient, input string) (*swarmapi.Network, error) {
-	// GetNetwork to match via full ID.
-	rg, err := c.GetNetwork(ctx, &swarmapi.GetNetworkRequest{NetworkID: input})
-	if err != nil {
-		// If any error (including NotFound), ListNetworks to match via ID prefix and full name.
-		rl, err := c.ListNetworks(ctx, &swarmapi.ListNetworksRequest{Filters: &swarmapi.ListNetworksRequest_Filters{Names: []string{input}}})
-		if err != nil || len(rl.Networks) == 0 {
-			rl, err = c.ListNetworks(ctx, &swarmapi.ListNetworksRequest{Filters: &swarmapi.ListNetworksRequest_Filters{IDPrefixes: []string{input}}})
-		}
-
-		if err != nil {
-			return nil, err
-		}
-
-		if len(rl.Networks) == 0 {
-			return nil, fmt.Errorf("network %s not found", input)
-		}
-
-		if l := len(rl.Networks); l > 1 {
-			return nil, fmt.Errorf("network %s is ambiguous (%d matches found)", input, l)
-		}
-
-		return rl.Networks[0], nil
-	}
-	return rg.Network, nil
 }
 
 // Cleanup stops active swarm node. This is run before daemon shutdown.

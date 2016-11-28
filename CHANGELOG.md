@@ -90,7 +90,7 @@ be found.
 + Add `--format` on `docker stats` [#24987](https://github.com/docker/docker/pull/24987)
 + Make `docker node ps` default to `self` in swarm node [#25214](https://github.com/docker/docker/pull/25214)
 + Add `--group` in `docker service create` [#25317](https://github.com/docker/docker/pull/25317)
-+ Add `--no-trunc` to service/node/stack ps output [#25337(https://github.com/docker/docker/pull/25337)
++ Add `--no-trunc` to service/node/stack ps output [#25337](https://github.com/docker/docker/pull/25337)
 + Add Logs to `ContainerAttachOptions` so go clients can request to retrieve container logs as part of the attach process [#26718](https://github.com/docker/docker/pull/26718)
 + Allow client to talk to an older server [#27745](https://github.com/docker/docker/pull/27745)
 * Inform user client-side that a container removal is in progress [#26074](https://github.com/docker/docker/pull/26074)
@@ -171,7 +171,7 @@ be found.
 - Pin images by digest for `docker service create` and `update` [#28173](https://github.com/docker/docker/pull/28173)
 - Add short (`-f`) flag for `docker node rm --force` and `docker swarm leave --force` [#28196](https://github.com/docker/docker/pull/28196)
 + Don't repull image if pinned by digest [#28265](https://github.com/docker/docker/pull/28265)
-+ swarm-mode support for indows [#27838](https://github.com/docker/docker/pull/27838)
++ swarm-mode support for Windows [#27838](https://github.com/docker/docker/pull/27838)
 
 ### Volume
 

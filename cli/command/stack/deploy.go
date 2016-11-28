@@ -1,11 +1,13 @@
 package stack
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/net/context"
@@ -13,6 +15,7 @@ import (
 	"github.com/aanand/compose-file/loader"
 	composetypes "github.com/aanand/compose-file/types"
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
@@ -47,7 +50,6 @@ func newDeployCommand(dockerCli *command.DockerCli) *cobra.Command {
 			opts.namespace = args[0]
 			return runDeploy(dockerCli, opts)
 		},
-		Tags: map[string]string{"experimental": "", "version": "1.25"},
 	}
 
 	flags := cmd.Flags()
@@ -58,19 +60,36 @@ func newDeployCommand(dockerCli *command.DockerCli) *cobra.Command {
 }
 
 func runDeploy(dockerCli *command.DockerCli, opts deployOptions) error {
+	ctx := context.Background()
+
 	switch {
 	case opts.bundlefile == "" && opts.composefile == "":
 		return fmt.Errorf("Please specify either a bundle file (with --bundle-file) or a Compose file (with --compose-file).")
 	case opts.bundlefile != "" && opts.composefile != "":
 		return fmt.Errorf("You cannot specify both a bundle file and a Compose file.")
 	case opts.bundlefile != "":
-		return deployBundle(dockerCli, opts)
+		return deployBundle(ctx, dockerCli, opts)
 	default:
-		return deployCompose(dockerCli, opts)
+		return deployCompose(ctx, dockerCli, opts)
 	}
 }
 
-func deployCompose(dockerCli *command.DockerCli, opts deployOptions) error {
+// checkDaemonIsSwarmManager does an Info API call to verify that the daemon is
+// a swarm manager. This is necessary because we must create networks before we
+// create services, but the API call for creating a network does not return a
+// proper status code when it can't create a network in the "global" scope.
+func checkDaemonIsSwarmManager(ctx context.Context, dockerCli *command.DockerCli) error {
+	info, err := dockerCli.Client().Info(ctx)
+	if err != nil {
+		return err
+	}
+	if !info.Swarm.ControlAvailable {
+		return errors.New("This node is not a swarm manager. Use \"docker swarm init\" or \"docker swarm join\" to connect this node to swarm and try again.")
+	}
+	return nil
+}
+
+func deployCompose(ctx context.Context, dockerCli *command.DockerCli, opts deployOptions) error {
 	configDetails, err := getConfigDetails(opts)
 	if err != nil {
 		return err
@@ -98,7 +117,10 @@ func deployCompose(dockerCli *command.DockerCli, opts deployOptions) error {
 			propertyWarnings(deprecatedProperties))
 	}
 
-	ctx := context.Background()
+	if err := checkDaemonIsSwarmManager(ctx, dockerCli); err != nil {
+		return err
+	}
+
 	namespace := namespace{name: opts.namespace}
 
 	networks := convertNetworks(namespace, config.Networks)
@@ -250,9 +272,13 @@ func convertServiceNetworks(
 
 	nets := []swarm.NetworkAttachmentConfig{}
 	for networkName, network := range networks {
+		var aliases []string
+		if network != nil {
+			aliases = network.Aliases
+		}
 		nets = append(nets, swarm.NetworkAttachmentConfig{
 			Target:  namespace.scope(networkName),
-			Aliases: append(network.Aliases, name),
+			Aliases: append(aliases, name),
 		})
 	}
 	return nets
@@ -408,14 +434,19 @@ func deployServices(
 			if sendAuth {
 				updateOpts.EncodedRegistryAuth = encodedAuth
 			}
-			if err := apiClient.ServiceUpdate(
+			response, err := apiClient.ServiceUpdate(
 				ctx,
 				service.ID,
 				service.Version,
 				serviceSpec,
 				updateOpts,
-			); err != nil {
+			)
+			if err != nil {
 				return err
+			}
+
+			for _, warning := range response.Warnings {
+				fmt.Fprintln(dockerCli.Err(), warning)
 			}
 		} else {
 			fmt.Fprintf(out, "Creating service %s\n", name)
@@ -487,6 +518,11 @@ func convertService(
 		return swarm.ServiceSpec{}, err
 	}
 
+	healthcheck, err := convertHealthcheck(service.HealthCheck)
+	if err != nil {
+		return swarm.ServiceSpec{}, err
+	}
+
 	serviceSpec := swarm.ServiceSpec{
 		Annotations: swarm.Annotations{
 			Name:   name,
@@ -499,6 +535,7 @@ func convertService(
 				Args:            service.Command,
 				Hostname:        service.Hostname,
 				Hosts:           convertExtraHosts(service.ExtraHosts),
+				Healthcheck:     healthcheck,
 				Env:             convertEnvironment(service.Environment),
 				Labels:          getStackLabels(namespace.name, service.Labels),
 				Dir:             service.WorkingDir,
@@ -526,9 +563,50 @@ func convertService(
 func convertExtraHosts(extraHosts map[string]string) []string {
 	hosts := []string{}
 	for host, ip := range extraHosts {
-		hosts = append(hosts, fmt.Sprintf("%s %s", host, ip))
+		hosts = append(hosts, fmt.Sprintf("%s %s", ip, host))
 	}
 	return hosts
+}
+
+func convertHealthcheck(healthcheck *composetypes.HealthCheckConfig) (*container.HealthConfig, error) {
+	if healthcheck == nil {
+		return nil, nil
+	}
+	var (
+		err               error
+		timeout, interval time.Duration
+		retries           int
+	)
+	if healthcheck.Disable {
+		if len(healthcheck.Test) != 0 {
+			return nil, fmt.Errorf("command and disable key can't be set at the same time")
+		}
+		return &container.HealthConfig{
+			Test: []string{"NONE"},
+		}, nil
+
+	}
+	if healthcheck.Timeout != "" {
+		timeout, err = time.ParseDuration(healthcheck.Timeout)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if healthcheck.Interval != "" {
+		interval, err = time.ParseDuration(healthcheck.Interval)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if healthcheck.Retries != nil {
+		retries = int(*healthcheck.Retries)
+	}
+	return &container.HealthConfig{
+		Test:     healthcheck.Test,
+		Timeout:  timeout,
+		Interval: interval,
+		Retries:  retries,
+	}, nil
 }
 
 func convertRestartPolicy(restart string, source *composetypes.RestartPolicy) (*swarm.RestartPolicy, error) {
@@ -566,8 +644,12 @@ func convertUpdateConfig(source *composetypes.UpdateConfig) *swarm.UpdateConfig 
 	if source == nil {
 		return nil
 	}
+	parallel := uint64(1)
+	if source.Parallelism != nil {
+		parallel = *source.Parallelism
+	}
 	return &swarm.UpdateConfig{
-		Parallelism:     source.Parallelism,
+		Parallelism:     parallel,
 		Delay:           source.Delay,
 		FailureAction:   source.FailureAction,
 		Monitor:         source.Monitor,

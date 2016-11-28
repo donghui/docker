@@ -907,7 +907,7 @@ should fix the problem.
 ## Mapping Ports for External Usage
 
 The exposed port of an application can be mapped to a host port using the **-p**
-flag. For example, a httpd port 80 can be mapped to the host port 8080 using the
+flag. For example, an httpd port 80 can be mapped to the host port 8080 using the
 following:
 
     # docker run -p 8080:80 -d -i -t fedora/httpd
@@ -989,7 +989,7 @@ You would have to write policy defining a `svirt_apache_t` type.
 If you want to set `/dev/sda` device weight to `200`, you can specify the device
 weight by `--blkio-weight-device` flag. Use the following command:
 
-   # docker run -it --blkio-weight-device "/dev/sda:200" ubuntu
+    # docker run -it --blkio-weight-device "/dev/sda:200" ubuntu
 
 ## Specify isolation technology for container (--isolation)
 

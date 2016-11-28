@@ -10,9 +10,10 @@ import (
 )
 
 var (
-	pName        = "tiborvass/no-remove"
-	pTag         = "latest"
-	pNameWithTag = pName + ":" + pTag
+	pluginProcessName = "no-remove"
+	pName             = "tiborvass/no-remove"
+	pTag              = "latest"
+	pNameWithTag      = pName + ":" + pTag
 )
 
 func (s *DockerSuite) TestPluginBasicOps(c *check.C) {
@@ -142,7 +143,7 @@ func (s *DockerSuite) TestPluginInstallArgs(c *check.C) {
 }
 
 func (s *DockerSuite) TestPluginInstallImage(c *check.C) {
-	testRequires(c, DaemonIsLinux)
+	testRequires(c, DaemonIsLinux, Network)
 	out, _, err := dockerCmdWithError("plugin", "install", "redis")
 	c.Assert(err, checker.NotNil)
 	c.Assert(out, checker.Contains, "content is not a plugin")
